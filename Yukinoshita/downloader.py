@@ -1,5 +1,5 @@
 import os
-from threading import Thread, Lock
+from threading import Lock
 from progress.bar import IncrementalBar
 from Yukinoshita.progress_tracker import ProgressTracker
 from Yukinoshita.decrypter_provider import DecrypterProvider

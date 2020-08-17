@@ -1,7 +1,6 @@
 import abc
 
 class NetworkBase(abc.ABC):
-    def init():
-        pass
-    def get():
+    @abc.abstractmethod
+    def get(self):
         pass

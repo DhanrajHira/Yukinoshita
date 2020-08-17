@@ -18,6 +18,8 @@ setup(
     ],
     python_requires=">=3.6",
     install_requires=[
-    
+     "requests==2.22.0",
+     "pycryptodome==3.9.7",
+     "progress==1.5"
     ]   
 )
