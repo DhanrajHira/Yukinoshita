@@ -50,4 +50,4 @@ class DecrypterProvider(object):
     def get_key_uri(self):
         for key in self.m3u8.data["keys"]:
             if key != None:
-                return key 
+                return key["uri"] 

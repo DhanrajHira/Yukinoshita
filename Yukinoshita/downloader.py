@@ -3,6 +3,7 @@ from threading import Thread, Lock
 from progress.bar import IncrementalBar
 from Yukinoshita.progress_tracker import ProgressTracker
 from Yukinoshita.decrypter_provider import DecrypterProvider
+from Yukinoshita.merger import FFmpegMerger, ChunkMerger, ChunkRemover
 from concurrent.futures import ThreadPoolExecutor
 
 class Downloader(object):
@@ -146,7 +147,8 @@ class MultiThreadDownloader(object):
         self.max_threads = max_threads
         self.delete_chunks = delete_chunks
         self.hooks = hooks
-        self.progress_tracker = ProgressTracker(episode_id)
+        self.id = id
+        self.progress_tracker = ProgressTracker(id)
         self.__lock = Lock()
       
         try:
