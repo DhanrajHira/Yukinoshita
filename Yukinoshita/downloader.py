@@ -30,12 +30,12 @@ class Downloader(object):
         self.hooks = hooks
         self.progress_tracker = ProgressTracker(id)
 
-    def init_tracker(self):
+    def init_tracker(self, chunk_tuple_list, decrypter_provider):
         self.progress_tracker.init_tracker(
             {
-                "headers": None,
-                "cookies": None,
-                "segments": self.m3u8.data["segments"],
+                "network": self.__network__,
+                "decrypter_provider": decrypter_provider,
+                "chunk_tuple_list": chunk_tuple_list,
                 "file_name": self.file_name,
                 "total_chunks": self.total_chunks,
             }
@@ -59,8 +59,8 @@ class Downloader(object):
             pass
 
         self.progress_bar = IncrementalBar("Downloading", max=self.total_chunks)
-        #self.init_tracker()
         decrypter_provider = DecrypterProvider(self.__network__, self.m3u8)
+        self.init_tracker(chunk_tuple_list, decrypter_provider)
         for chunk_number, chunk_tuple in enumerate(chunk_tuple_list):
             # We need the chunk number here to name the files. Note that this is
             # different from the chunk number that is inside the tuple.
