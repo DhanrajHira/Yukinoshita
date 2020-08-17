@@ -1,8 +1,8 @@
 import os
 from threading import Thread, Lock
 from progress.bar import IncrementalBar
-from Sakurajima.utils.progress_tracker import ProgressTracker
-from Sakurajima.utils.decrypter_provider import DecrypterProvider
+from Yukinoshita.progress_tracker import ProgressTracker
+from Yukinoshita.decrypter_provider import DecrypterProvider
 from concurrent.futures import ThreadPoolExecutor
 
 class Downloader(object):
@@ -15,49 +15,25 @@ class Downloader(object):
         network,
         m3u8,
         file_name: str,
-        episode_id: int,
+        id: int,
         use_ffmpeg: bool = True,
-        include_intro: bool = False,
         delete_chunks: bool = True,
-        on_progress=None,
+        hooks = {},
     ):
-        """
-        :param network: The Sakurajima :class:`Network` object that is used to make network requests.  
-        :type network: :class:`Network`
-        :param m3u8: The M3U8 data of the episode that is to be downloaded.
-        :type m3u8: :class:`M3U8`
-        :param file_name: The name of the downloaded video file.
-        :type file_name: str
-        :param episode_id: The episode ID of the episode being downloaded.
-                           This is only required to uniquely identify the progree
-                           tracking data of the episode.
-        :type episode_id: int
-        :param use_ffmpeg: Whether to use ``ffmpeg`` to merge the downlaoded chunks, defaults to True
-        :type use_ffmpeg: bool, optional
-        :param include_intro: Whether to include the 5 second aniwatch intro, defaults to False
-        :type include_intro: bool, optional
-        :param delete_chunks: Whether to delete the downloaded chunks after that have been
-                              merged into a single file, defaults to True
-        :type delete_chunks: bool, optional
-        :param on_progress: Register a function that is called every time a chunk is downloaded, the function
-                            passed the chunk number of the downloaded chunk and the total number of chunks as 
-                            parameters, defaults to None
-        :type on_progress:  ``function``, optional
-        """
-        self.__network = network
+        self.__network__ = network
         self.m3u8 = m3u8
         self.file_name = file_name
+        self.id = id
         self.use_ffmpeg = use_ffmpeg
-        self.include_intro = include_intro
         self.delete_chunks = delete_chunks
-        self.on_progress = on_progress
-        self.progress_tracker = ProgressTracker(episode_id)
+        self.hooks = hooks
+        self.progress_tracker = ProgressTracker(id)
 
     def init_tracker(self):
         self.progress_tracker.init_tracker(
             {
-                "headers": self.__network.headers,
-                "cookies": self.__network.cookies,
+                "headers": None,
+                "cookies": None,
                 "segments": self.m3u8.data["segments"],
                 "file_name": self.file_name,
                 "total_chunks": self.total_chunks,
@@ -65,20 +41,15 @@ class Downloader(object):
         )
 
     def download(self):
-        """Runs the downloader and starts downloading the video file.
-        """
         chunk_tuple_list = []
         # Will hold a list of tuples of the form (chunk_number, chunk).
         # The chunk_number in this list will start from 1.
         for chunk_number, chunk in enumerate(self.m3u8.data["segments"]):
             chunk_tuple_list.append((chunk_number, chunk))
 
-        if not self.include_intro:
-            for chunk_tuple in chunk_tuple_list:
-                # Check if the string is in the URI of the chunk
-                if "img.aniwatch.me" in chunk_tuple[1]["uri"]:
-                    # Revome the tuple from the tuple list.
-                    chunk_tuple_list.remove(chunk_tuple) 
+        if self.hooks.get("modify_chunk_tuple_list", None) is not None:
+            chunk_tuple_list = self.hooks["modify_chunk_tuple_list"].__call__(chunk_tuple_list)
+
         self.total_chunks = len(chunk_tuple_list)
 
         try:
@@ -87,23 +58,23 @@ class Downloader(object):
             pass
 
         self.progress_bar = IncrementalBar("Downloading", max=self.total_chunks)
-        self.init_tracker()
-        decryter_provider = DecrypterProvider(self.__network, self.m3u8)
+        #self.init_tracker()
+        decrypter_provider = DecrypterProvider(self.__network__, self.m3u8)
         for chunk_number, chunk_tuple in enumerate(chunk_tuple_list):
             # We need the chunk number here to name the files. Note that this is
             # different from the chunk number that is inside the tuple.
             file_name = f"chunks\/{self.file_name}-{chunk_number}.chunk.ts"
             ChunkDownloader(
-                self.__network,
+                self.__network__,
                 chunk_tuple[1], # The segment data
                 file_name,
                 chunk_tuple[0], # The chunk number needed for decryption.
-                decryter_provider
+                decrypter_provider
                 ).download()
             self.progress_bar.next()
             self.progress_tracker.update_chunks_done(chunk_number)
-            if self.on_progress:
-                self.on_progress.__call__(chunk_number + 1, self.total_chunks)
+            if self.hooks.get("on_progress", None) is not None:
+                self.hooks["on_progress"].__call__(chunk_number + 1, self.total_chunks)
 
         self.progress_bar.finish()
 
@@ -126,17 +97,6 @@ class ChunkDownloader(object):
     The object that actually downloads a single chunk.
     """
     def __init__(self, network, segment, file_name, chunk_number, decrypt_provider: DecrypterProvider):
-        """
-        :param network: The Sakurajima :class:`Network` object that is used to make network requests. 
-        :type network: :class:`Network`
-        :param segment: The segement data from that M3U8 file that is to be downloaded. 
-        :type segment: :class:`dict`
-        :param file_name: The file name of the downloaded chunk.  
-        :type file_name: :class:`str`
-        :param chunk_number: The chunk number of the the chunk to be downloaded, required to generate
-                        the AES decryption initialization vector.
-        :type chunk_number: int
-        """
         self.__network = network
         self.segment = segment
         self.file_name = file_name
@@ -150,8 +110,10 @@ class ChunkDownloader(object):
             res = self.__network.get(self.segment["uri"])
             chunk = res.content
             key_dict = self.segment.get("key", None)
+            #This is done to check if the chunk in question is encrypted. 
             
             if key_dict is not None:
+                #If the chunk is encrypted it will have a key dict.
                 decrypted_chunk = self.decrypt_chunk(chunk)
                 videofile.write(decrypted_chunk)
             else:
@@ -171,43 +133,22 @@ class MultiThreadDownloader(object):
         network,
         m3u8,
         file_name: str,
-        episode_id: int,
+        id: int,
         max_threads: int = None,
         use_ffmpeg: bool = True,
-        include_intro: bool = False,
+        hooks = {},
         delete_chunks: bool = True,
     ):
-        """
-        :param network: The Sakurajima :class:`Network` object that is used to make network requests.
-        :type network: :class:`Network`
-        :type m3u8: :class:`M3U8`
-        :param file_name: The name of the downloaded video file.
-        :type file_name: str
-        :param episode_id: The episode ID of the episode being downloaded.
-                           This is only required to uniquely identify the progree
-                           tracking data of the episode.
-        :type episode_id: int
-        :param max_threads: The maximum number of threads that will be used for downloading, defaults to None,
-                            if None, the maximum possible number of threads will be used.
-        :type max_threads: int, optional
-        :param use_ffmpeg: Whether to use ``ffmpeg`` to merge the downlaoded chunks, defaults to True
-        :type use_ffmpeg: bool, optional
-        :param include_intro: Whether to include the 5 second aniwatch intro, defaults to False
-        :type include_intro: bool, optional
-        :param delete_chunks: Whether to delete the downloaded chunks after that have been
-                              merged into a single file, defaults to True
-        :type delete_chunks: bool, optional
-        """
         self.__network = network
         self.m3u8 = m3u8
         self.file_name = file_name
         self.use_ffmpeg = use_ffmpeg
         self.max_threads = max_threads
-        self.include_intro = include_intro
         self.delete_chunks = delete_chunks
-        self.threads = []
+        self.hooks = hooks
         self.progress_tracker = ProgressTracker(episode_id)
         self.__lock = Lock()
+      
         try:
             os.makedirs("chunks")
         except FileExistsError:
@@ -216,8 +157,8 @@ class MultiThreadDownloader(object):
     def init_tracker(self):
         self.progress_tracker.init_tracker(
             {
-                "headers": self.__network.headers,
-                "cookies": self.__network.cookies,
+                "headers": None,
+                "cookies": None,
                 "segments": self.m3u8.data["segments"],
                 "file_name": self.file_name,
                 "total_chunks": self.total_chunks,
@@ -245,20 +186,16 @@ class MultiThreadDownloader(object):
         decrypter_provider = DecrypterProvider(self.__network, self.m3u8)
         chunk_tuple_list = []
         # Will hold a list of tuples of the form (chunk_number, chunk).
-        # The chunk_number in this list will start from 1.
+        # The chunk_number in this list will start from 0.
         for chunk_number, chunk in enumerate(self.m3u8.data["segments"]):
             chunk_tuple_list.append((chunk_number, chunk))
 
-        if not self.include_intro:
-            for chunk_tuple in chunk_tuple_list:
-                # Check if the string is in the URI of the chunk
-                if "img.aniwatch.me" in chunk_tuple[1]["uri"]:
-                    # Revome the tuple from the tuple list.
-                    chunk_tuple_list.remove(chunk_tuple) 
-        
+        if self.hooks.get("modify_chunk_tuple_list", None) is not None:
+            chunk_tuple_list = self.hooks["modify_chunk_tuple_list"].__call__(chunk_tuple_list)
+
         self.total_chunks = len(chunk_tuple_list)
         self.progress_bar = IncrementalBar("Downloading", max=self.total_chunks)
-        self.init_tracker()
+        #self.init_tracker()
 
         segment_wrapper_list = []
 

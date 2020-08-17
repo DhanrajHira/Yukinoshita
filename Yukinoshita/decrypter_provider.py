@@ -2,11 +2,12 @@ from Crypto.Cipher import AES
 
 class DecrypterProvider(object):
 
-    def __init__(self, network, m3u8, get_by_comparison = False):
+    def __init__(self, network, m3u8, get_by_comparison = False, has_iv=False):
         self.__network = network
         self.m3u8 = m3u8
         self.key = None
-        self.uri = self.m3u8.data["keys"][1]["uri"]
+        self.uri = self.get_key_uri()
+        self.has_iv = has_iv
         if get_by_comparison:
             self.get_key_by_comparison()
         else:
@@ -40,5 +41,13 @@ class DecrypterProvider(object):
         return bytearray(iv)
     
     def get_decrypter(self, chunk_number) -> AES:
-        iv = self.create_initialization_vector(chunk_number)
-        return AES.new(self.get_key(), AES.MODE_CBC, iv = iv)
+        if self.has_iv:
+            iv = self.create_initialization_vector(chunk_number)
+            return AES.new(self.get_key(), AES.MODE_CBC, iv = iv)
+        else:
+            return AES.new(self.get_key(), AES.MODE_CBC)
+
+    def get_key_uri(self):
+        for key in self.m3u8.data["keys"]:
+            if key != None:
+                return key 
