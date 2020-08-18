@@ -13,7 +13,7 @@ class Resumer(object):
 
     def resume(self):
         resume_data, chunks_done = self.progress_tracker.get_progress_data()
-        chunk_tuple_list = resume_data["chu6nk_tuple_list"]
+        chunk_tuple_list = resume_data["chunk_tuple_list"]
         decrypter_provider = resume_data["decrypter_provider"]
         self.total_chunks = resume_data["total_chunks"]
         self.file_name  = resume_data["file_name"]
@@ -49,4 +49,3 @@ class Resumer(object):
             if self.delete_chunks:
                 remover = ChunkRemover(self.file_name, self.total_chunks)
                 remover.remove()
-                
