@@ -45,9 +45,9 @@ class FFmpegMerger(object):
         concat = '"concat'
         for x in range(0, self.total_chunks):
             if x == 0:
-                concat += f":chunks\/{self.file_name}-{x}.chunk.ts"
+                concat += f":segments\/{self.file_name}-{x}.chunk.ts"
             else:
-                concat += f"|chunks\/{self.file_name}-{x}.chunk.ts"
+                concat += f"|segments\/{self.file_name}-{x}.chunk.ts"
         concat += '"'
         subprocess.run(f'ffmpeg -i {concat} -c copy "{self.file_name}.mp4"')
 
