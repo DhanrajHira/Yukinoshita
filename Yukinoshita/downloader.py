@@ -150,8 +150,3 @@ class Downloader(object):
             m3u8 = file.read()
         return cls(m3u8, output_file_name, max_workers)
 
-async def main():
-    d = await Downloader.from_url("https://vengeance.animex.vip/GYJQV73V6/episodes/1/master.m3u8", "demo", 20)
-    await d.run()
-if __name__ == "__main__":
-    asyncio.run(main())
