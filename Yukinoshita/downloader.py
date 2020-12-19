@@ -3,13 +3,30 @@ import asyncio
 import m3u8
 from Crypto.Cipher import AES
 import os
-from multiprocessing import connection, Process, Pipe
+from multiprocessing import Semaphore, connection, Process, Pipe
 import subprocess
+import logging
+
+#logging.basicConfig(level=logging.CRITICAL)
 
 SEGMENT_DIR = "Segments"
 SEGMENT_EXTENSION = ".segment.ts"
+RESUME_EXTENSION = ".resumeinfo.yuk"
 OUTPUT_EXTENSION = ".mp4"
 
+def _parse_resume_info(raw_file_data):
+    lines = raw_file_data.split("\n")
+    return (
+        int(line.split(" ")[1]) 
+        for line in filter(
+            lambda line: line.startswith("SEGMENT"),
+            lines
+            )
+        )
+
+def _write_resume_info(file_name, segment_number):
+    with open(file_name, "a") as file:
+        file.write(f"SEGMENT {segment_number}\n")
 
 def _merge_segments(output_file_name):
     # Run the command to merge the downloaded files.
@@ -17,7 +34,8 @@ def _merge_segments(output_file_name):
         f"ffmpeg -f concat -safe 0 -i Segments{os.path.sep}{output_file_name}-concat_info.txt -c copy {output_file_name}{OUTPUT_EXTENSION}"
         )
 
-def _decrypt_worker(pipe_output: connection.PipeConnection):
+def _decrypt_worker(pipe_output: connection.PipeConnection, resume_file_path: str, progress_tracker):
+    logging.debug("Decrypt process started.")
     while True:
         pipe_message = pipe_output.recv()
         
@@ -26,14 +44,24 @@ def _decrypt_worker(pipe_output: connection.PipeConnection):
         if pipe_message is None:
             break
 
-        segment, key, file_name = pipe_message
+        segment, key, file_name, segment_number = pipe_message
         if key != b"":
             decrypted_segment = AES.new(key, AES.MODE_CBC).decrypt(segment)
+            logging.info(f"Decrypted segment number {segment_number}.")
         else:
             decrypted_segment = segment
+
         with open(file_name, "wb+") as file:
             file.write(decrypted_segment)
-            print(f"Written: {file_name}")
+        
+        # Update the resume info.
+        _write_resume_info(resume_file_path, segment_number)
+        
+        logging.info(f"Wrote: {file_name}")
+
+        # Display the progress.
+        progress_tracker.increment_done()
+        progress_tracker.display()
 
 def _write_concat_info(file_name, segment_count):
     # Write the concat info needed by ffmpeg to a file.
@@ -41,14 +69,16 @@ def _write_concat_info(file_name, segment_count):
         for segment_number in range(segment_count):
             f = "file "  + SEGMENT_DIR + '\\' + os.path.sep + f"{file_name}-{segment_number}{SEGMENT_EXTENSION}\n"
             file.write(f)
+    logging.info("Wrote Concat Info.")
         
-
 async def _download_worker(download_queue: asyncio.Queue, decrypt_pipe_input: connection.PipeConnection, client: aiohttp.ClientSession):
+    logging.debug("Started download worker.")
     while True:
         segment_data = await download_queue.get()
-        file_name, segment = segment_data
+        file_name, segment, segment_number = segment_data
         resp: aiohttp.ClientResponse = await client.get(segment.uri)
         resp_data: bytes = await resp.read()
+        logging.info(f"Fetched segment number {segment_number}.")
 
         if segment.key is not None and segment.key !='':
             key_resp = await client.get(segment.key.uri)
@@ -59,16 +89,28 @@ async def _download_worker(download_queue: asyncio.Queue, decrypt_pipe_input: co
         decrypt_pipe_input.send((
             resp_data, 
             key,
-            file_name
+            file_name,
+            segment_number
         ))
         download_queue.task_done()
 
+class ProgressTracker(object):
+    def __init__(self, total: int) -> None:
+        self.total = total 
+        self.done = 0
+    
+    def display(self) -> None:
+        print(f"{self.done}/{self.total} done.", end="\r")
+
+    def increment_done(self) -> None:
+        self.done += 1
 
 class Downloader(object):
-    def __init__(self, m3u8_str: str, output_file_name: str, max_workers: int = 3) -> None:
+    def __init__(self, m3u8_str: str, output_file_name: str, resume_code=None, max_workers: int = 3) -> None:
         self._m3u8: m3u8.M3U8 = m3u8.M3U8(m3u8_str)
         self._max_workers = max_workers
         self._output_file_name = output_file_name
+        self._resume_code = resume_code or output_file_name
 
     async def run(self):
         # The download queue that will be used by download workers
@@ -87,28 +129,47 @@ class Downloader(object):
             stream = m3u8.M3U8(await resp.text()) 
         else:
             stream = self._m3u8
-        
+        logging.info("Selected playlist.")
+
         # Make sure the the SEGMENT_DIR exists.
         try:
             os.makedirs(SEGMENT_DIR)
         except FileExistsError:
             pass
+        
+        resume_file_path = os.path.join(SEGMENT_DIR, f"{self._resume_code}{RESUME_EXTENSION}")
+        if os.path.isfile(resume_file_path):
+            with open(resume_file_path) as file:
+                resume_info = _parse_resume_info(file.read())
+            logging.info(f"Resume data found for {self._resume_code}.")
+        else:
+            with open(resume_file_path, "w+") as file:
+                pass
+            resume_info = []
+            logging.info(f"No resume data found for {self._resume_code}")
 
-        with open(os.path.join(SEGMENT_DIR, "index.yk"), "w+") as file:
-            file.write("test")
+
+        assert len(stream.segments) != 0
+
+        segment_list = tuple(filter(lambda seg: seg[0] not in resume_info, enumerate(stream.segments)))
+
+        progress_tracker = ProgressTracker(len(segment_list))
         
         # Start the process that will decrypt and write the files to disk.
-        decrypt_process = Process(target=_decrypt_worker, args=(decrypt_pipe_output,), daemon=True)
+        decrypt_process = Process(target=_decrypt_worker, args=(decrypt_pipe_output, resume_file_path, progress_tracker), daemon=True)
         decrypt_process.start()
+        logging.debug("Running decrypt process.")
 
         # Populate the download queue.
-        for segment_number, segment in enumerate(stream.segments):
+        for segment_number, segment in segment_list:
             await download_queue.put((
                 os.path.join(SEGMENT_DIR,f"{self._output_file_name}-{segment_number}{SEGMENT_EXTENSION}"),
-                segment
+                segment,
+                segment_number
                 ))
 
         # Start the workers but wrapping the coroutines into tasks.
+        logging.info(f"Starting {self._max_workers} download workers.")
         workers = [
             asyncio.create_task(_download_worker(download_queue, decrypt_pipe_input, client))
             for _ in range(self._max_workers)
@@ -116,6 +177,7 @@ class Downloader(object):
         
         # Wait for the download workers to finish.
         await download_queue.join()
+        logging.info("Downloading complete.")
 
         # After all the tasks in the download queue are finished,
         # put a None into the decrypt pip to stop the decrypt process.
@@ -137,16 +199,17 @@ class Downloader(object):
 
 
     @classmethod
-    async def from_url(cls, url, output_file_name, max_workers=5):
+    async def from_url(cls, url: str, output_file_name: str, resume_code=None, max_workers: int = 3):
         client = aiohttp.ClientSession()
         resp = await client.get(url)
         resp_text = await resp.text()
         await client.close()
-        return cls(resp_text, output_file_name, max_workers)
+        return cls(resp_text, output_file_name, resume_code, max_workers)
 
     @classmethod
-    async def from_file(cls, file_path, output_file_name, max_workers=5):
+    async def from_file(cls, file_path: str, output_file_name: str, resume_code=None, max_workers: int = 3):
         with open(file_path, "r") as file:
             m3u8 = file.read()
-        return cls(m3u8, output_file_name, max_workers)
+        return cls(m3u8, output_file_name, resume_code, max_workers)
+        
 
