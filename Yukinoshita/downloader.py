@@ -1,250 +1,255 @@
+import aiohttp
+import asyncio
+import m3u8
 import os
-from threading import Lock
-from progress.bar import IncrementalBar
-from Yukinoshita.progress_tracker import ProgressTracker
-from Yukinoshita.decrypter_provider import DecrypterProvider
-from Yukinoshita.merger import FFmpegMerger, ChunkMerger, ChunkRemover
-from concurrent.futures import ThreadPoolExecutor
+import shutil
+from Crypto.Cipher import AES
+from multiprocessing import connection, Process, Pipe
+import subprocess
+import logging
+
+# logging.basicConfig(level=logging.CRITICAL)
+
+SEGMENT_DIR = "Segments"
+SEGMENT_EXTENSION = ".segment.ts"
+RESUME_EXTENSION = ".resumeinfo.yuk"
+OUTPUT_EXTENSION = ".mp4"
+
+
+def _parse_resume_info(raw_file_data):
+    lines = raw_file_data.split("\n")
+    lines = filter(
+        lambda line: line.startswith("SEGMENT"),
+        lines
+    )
+    return tuple(
+        int(line.split(" ")[1])
+        for line in lines
+    )
+
+
+def _write_resume_info(file_name, segment_number):
+    with open(file_name, "a") as file:
+        file.write(f"SEGMENT {segment_number}\n")
+
+
+def _merge_segments(output_file_name):
+    # Run the command to merge the downloaded files.
+    subprocess.run(
+        f"ffmpeg -f concat -safe 0 -i Segments{os.path.sep}{output_file_name}-concat_info.txt -c copy {output_file_name}{OUTPUT_EXTENSION} -hide_banner -loglevel warning"
+    )
+
+def _remove_segments():
+    if os.path.isdir(SEGMENT_DIR):
+        shutil.rmtree(SEGMENT_DIR)
+
+def _decrypt_worker(
+        pipe_output: connection.PipeConnection,
+        resume_file_path: str,
+        progress_tracker):
+    logging.debug("Decrypt process started.")
+    while True:
+        pipe_message = pipe_output.recv()
+
+        # Break if a None object is encountered as this means that
+        # no more segments will be added to the pipe,
+        if pipe_message is None:
+            break
+
+        segment, key, file_name, segment_number = pipe_message
+        if key != b"":
+            decrypted_segment = AES.new(key, AES.MODE_CBC).decrypt(segment)
+            logging.info(f"Decrypted segment number {segment_number}.")
+        else:
+            decrypted_segment = segment
+
+        with open(file_name, "wb+") as file:
+            file.write(decrypted_segment)
+
+        # Update the resume info.
+        _write_resume_info(resume_file_path, segment_number)
+
+        logging.info(f"Wrote: {file_name}")
+
+        # Display the progress.
+        progress_tracker.increment_done()
+        progress_tracker.display()
+
+
+def _write_concat_info(file_name, segment_count):
+    # Write the concat info needed by ffmpeg to a file.
+    with open(os.path.join(SEGMENT_DIR, f"{file_name}-concat_info.txt"), "w+") as file:
+        for segment_number in range(segment_count):
+            f = "file " + SEGMENT_DIR + '\\' + os.path.sep + \
+                f"{file_name}-{segment_number}{SEGMENT_EXTENSION}\n"
+            file.write(f)
+    logging.info("Wrote Concat Info.")
+
+
+async def _download_worker(download_queue: asyncio.Queue, decrypt_pipe_input: connection.PipeConnection, client: aiohttp.ClientSession):
+    logging.debug("Started download worker.")
+    while True:
+        segment_data = await download_queue.get()
+        file_name, segment, segment_number = segment_data
+        resp: aiohttp.ClientResponse = await client.get(segment.uri)
+        resp_data: bytes = await resp.read()
+        logging.info(f"Fetched segment number {segment_number}.")
+
+        if segment.key is not None and segment.key != '':
+            key_resp = await client.get(segment.key.uri)
+            key = await key_resp.read()
+        else:
+            key = b""
+
+        decrypt_pipe_input.send((
+            resp_data,
+            key,
+            file_name,
+            segment_number
+        ))
+        download_queue.task_done()
+
+
+class ProgressTracker(object):
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.done = 0
+
+    def display(self) -> None:
+        print(f"{self.done}/{self.total} done.", end="\r")
+
+    def increment_done(self) -> None:
+        self.done += 1
+
 
 class Downloader(object):
-    """
-    Facilitates downloading an episode from aniwatch.me using a single thread.
-
-    """
     def __init__(
-        self,
-        network,
-        m3u8,
-        file_name: str,
-        id: int,
-        use_ffmpeg: bool = True,
-        delete_chunks: bool = True,
-        hooks = {},
-    ):
-        self.__network__ = network
-        self.m3u8 = m3u8
-        self.file_name = file_name
-        self.id = id
-        self.use_ffmpeg = use_ffmpeg
-        self.delete_chunks = delete_chunks
-        self.hooks = hooks
-        self.progress_tracker = ProgressTracker(id)
+            self,
+            m3u8_str: str,
+            output_file_name: str,
+            resume_code=None,
+            max_workers: int = 3,
+            hooks: dict = {}) -> None:
+        self._m3u8: m3u8.M3U8 = m3u8.M3U8(m3u8_str)
+        self._max_workers = max_workers
+        self._output_file_name = output_file_name.replace(" ", "-")
+        self._resume_code = resume_code or self._output_file_name
+        self._hooks = hooks
+    async def run(self):
+        # The download queue that will be used by download workers
+        download_queue: asyncio.Queue = asyncio.Queue()
 
-    def init_tracker(self, chunk_tuple_list, decrypter_provider):
-        self.progress_tracker.init_tracker(
-            {
-                "network": self.__network__,
-                "decrypter_provider": decrypter_provider,
-                "chunk_tuple_list": chunk_tuple_list,
-                "file_name": self.file_name,
-                "total_chunks": self.total_chunks,
-            }
-        )
+        # Pipe that will be used to the download workers to send the downloaded
+        # data to the decrypt process for decryption and for writing to the
+        # disk.
+        decrypt_pipe_output, decrypt_pipe_input = Pipe()
+        client = aiohttp.ClientSession()
 
-    def download(self):
-        chunk_tuple_list = []
-        # Will hold a list of tuples of the form (chunk_number, chunk).
-        # The chunk_number in this list will start from 1.
-        for chunk_number, chunk in enumerate(self.m3u8.data["segments"]):
-            chunk_tuple_list.append((chunk_number, chunk))
-
-        if self.hooks.get("modify_chunk_tuple_list", None) is not None:
-            chunk_tuple_list = self.hooks["modify_chunk_tuple_list"].__call__(chunk_tuple_list)
-
-        self.total_chunks = len(chunk_tuple_list)
-
-        try:
-            os.makedirs("chunks")
-        except FileExistsError:
-            pass
-
-        self.progress_bar = IncrementalBar("Downloading", max=self.total_chunks)
-        decrypter_provider = DecrypterProvider(self.__network__, self.m3u8)
-        self.init_tracker(chunk_tuple_list, decrypter_provider)
-        for chunk_number, chunk_tuple in enumerate(chunk_tuple_list):
-            # We need the chunk number here to name the files. Note that this is
-            # different from the chunk number that is inside the tuple.
-            file_name = f"chunks\/{self.file_name}-{chunk_number}.chunk.ts"
-            ChunkDownloader(
-                self.__network__,
-                chunk_tuple[1], # The segment data
-                file_name,
-                chunk_tuple[0], # The chunk number needed for decryption.
-                decrypter_provider
-                ).download()
-            self.progress_bar.next()
-            self.progress_tracker.update_chunks_done(chunk_number)
-            if self.hooks.get("on_progress", None) is not None:
-                self.hooks["on_progress"].__call__(chunk_number + 1, self.total_chunks)
-
-        self.progress_bar.finish()
-
-    def merge(self):
-        """Merges the downloaded chunks into a single file.
-        """
-        if self.use_ffmpeg:
-            FFmpegMerger(self.file_name, self.total_chunks).merge()
-        else:
-            ChunkMerger(self.file_name, self.total_chunks).merge()
-
-    def remove_chunks(self):
-        """Deletes the downloaded chunks.
-        """
-        ChunkRemover(self.file_name, self.total_chunks).remove()
-
-
-class ChunkDownloader(object):
-    """
-    The object that actually downloads a single chunk.
-    """
-    def __init__(self, network, segment, file_name, chunk_number, decrypt_provider: DecrypterProvider):
-        self.__network = network
-        self.segment = segment
-        self.file_name = file_name
-        self.chunk_number = chunk_number,
-        self.decrypter_provider = decrypt_provider
-
-    def download(self):
-        """Starts downloading the chunk.
-        """
-        with open(self.file_name, "wb") as videofile:
-            res = self.__network.get(self.segment["uri"])
-            chunk = res.content
-            key_dict = self.segment.get("key", None)
-            #This is done to check if the chunk in question is encrypted. 
-            
-            if key_dict is not None:
-                #If the chunk is encrypted it will have a key dict.
-                decrypted_chunk = self.decrypt_chunk(chunk)
-                videofile.write(decrypted_chunk)
+        # Check if the m3u8 file passed in has multiple streams, if this is the
+        # case then select the stream with the highest "bandwidth" specified.
+        if len(self._m3u8.playlists):
+            if self._hooks.get("playlist_selector", None):
+                stream_uri = self._hooks["playlist_selector"](self._m3u8.playlists).uri
             else:
-                videofile.write(chunk)
-    
-    def decrypt_chunk(self, chunk):
-        decryter = self.decrypter_provider.get_decrypter(self.chunk_number)
-        return decryter.decrypt(chunk)
+                stream_uri = max(
+                    *self._m3u8.playlists,
+                    key=lambda p: p.stream_info.bandwidth).uri
+            resp = await client.get(stream_uri)
+            stream = m3u8.M3U8(await resp.text())
+        else:
+            stream = self._m3u8
+        logging.info("Selected playlist.")
 
-
-class MultiThreadDownloader(object):
-    """
-    Facilitates downloading an episode from aniwatch.me using multiple threads.
-    """
-    def __init__(
-        self,
-        network,
-        m3u8,
-        file_name: str,
-        id: int,
-        max_threads: int = None,
-        use_ffmpeg: bool = True,
-        hooks = {},
-        delete_chunks: bool = True,
-    ):
-        self.__network = network
-        self.m3u8 = m3u8
-        self.file_name = file_name
-        self.use_ffmpeg = use_ffmpeg
-        self.max_threads = max_threads
-        self.delete_chunks = delete_chunks
-        self.hooks = hooks
-        self.id = id
-        self.progress_tracker = ProgressTracker(id)
-        self.__lock = Lock()
-      
+        # Make sure the the SEGMENT_DIR exists.
         try:
-            os.makedirs("chunks")
+            os.makedirs(SEGMENT_DIR)
         except FileExistsError:
             pass
 
-    def init_tracker(self):
-        self.progress_tracker.init_tracker(
-            {
-                "headers": None,
-                "cookies": None,
-                "segments": self.m3u8.data["segments"],
-                "file_name": self.file_name,
-                "total_chunks": self.total_chunks,
-            }
-        )
-
-
-    def assign_segments(self, segment):
-
-        ChunkDownloader(
-            segment.network,
-            segment.segment,
-            segment.file_name,
-            segment.chunk_number,
-            segment.decrypter_provider
-        ).download()
-        with self.__lock:
-            self.progress_tracker.update_chunks_done(segment.chunk_number)
-            self.progress_bar.next()
-
-    def download(self):
-        """Runs the downloader and starts downloading the video file.
-        """
-
-        decrypter_provider = DecrypterProvider(self.__network, self.m3u8)
-        chunk_tuple_list = []
-        # Will hold a list of tuples of the form (chunk_number, chunk).
-        # The chunk_number in this list will start from 0.
-        for chunk_number, chunk in enumerate(self.m3u8.data["segments"]):
-            chunk_tuple_list.append((chunk_number, chunk))
-
-        if self.hooks.get("modify_chunk_tuple_list", None) is not None:
-            chunk_tuple_list = self.hooks["modify_chunk_tuple_list"].__call__(chunk_tuple_list)
-
-        self.total_chunks = len(chunk_tuple_list)
-        self.progress_bar = IncrementalBar("Downloading", max=self.total_chunks)
-        #self.init_tracker()
-
-        segment_wrapper_list = []
-
-        for chunk_number, chunk in enumerate(chunk_tuple_list):
-            file_name = f"chunks\/{self.file_name}-{chunk_number}.chunk.ts"
-            segment_wrapper = _SegmentWrapper(
-                self.__network,
-                chunk[1], # Segment data.
-                file_name,
-                chunk[0], # The chunk number needed for decryption.
-                decrypter_provider
-            )
-            segment_wrapper_list.append(segment_wrapper)
-
-        if self.max_threads == None:
-            # If the value for max threads is not provided, then it is set to 
-            # the total number of chunks that are to be downloaded.
-            self.max_threads = self.total_chunks
-
-        self.executor = ThreadPoolExecutor(max_workers = self.max_threads)
-        
-        with self.executor as exe:
-            futures = exe.map(self.assign_segments, segment_wrapper_list)
-            for future in futures: 
-                # This loop servers to run the generator.
-                pass
-        self.progress_bar.finish()
-
-    def merge(self):
-        """Merges the downloaded chunks into a single file.
-        """
-        if self.use_ffmpeg:
-            FFmpegMerger(self.file_name, self.total_chunks).merge()
+        resume_file_path = os.path.join(
+            SEGMENT_DIR, f"{self._resume_code}{RESUME_EXTENSION}")
+        if os.path.isfile(resume_file_path):
+            with open(resume_file_path) as file:
+                resume_info = _parse_resume_info(file.read())
+            logging.info(f"Resume data found for {self._resume_code}.")
         else:
-            ChunkMerger(self.file_name, self.total_chunks).merge()
+            with open(resume_file_path, "w+") as file:
+                pass
+            resume_info = []
+            logging.info(f"No resume data found for {self._resume_code}")
 
-    def remove_chunks(self):
-        """Deletes the downloaded chunks.
-        """
-        ChunkRemover(self.file_name, self.total_chunks).remove()
+        assert len(stream.segments) != 0
 
-class _SegmentWrapper(object):
-    # As the name suggests, this is only wrapper class introduced with a hope that it 
-    # will lead to more readable code.
-    def __init__(self, network, segment, file_name, chunk_number, decrypter_provider):
-        self.network = network
-        self.segment = segment
-        self.file_name = file_name
-        self.chunk_number = chunk_number
-        self.decrypter_provider = decrypter_provider
+        segment_list = tuple(
+            filter(
+                lambda seg: seg[0] not in resume_info,
+                enumerate(
+                    stream.segments)))
+
+        progress_tracker = ProgressTracker(len(segment_list))
+
+        # Start the process that will decrypt and write the files to disk.
+        decrypt_process = Process(
+            target=_decrypt_worker,
+            args=(
+                decrypt_pipe_output,
+                resume_file_path,
+                progress_tracker),
+            daemon=True)
+        decrypt_process.start()
+        logging.debug("Running decrypt process.")
+
+        # Populate the download queue.
+        for segment_number, segment in segment_list:
+            await download_queue.put((
+                os.path.join(SEGMENT_DIR, f"{self._resume_code}-{segment_number}{SEGMENT_EXTENSION}"),
+                segment,
+                segment_number
+            ))
+
+        # Start the workers but wrapping the coroutines into tasks.
+        logging.info(f"Starting {self._max_workers} download workers.")
+        workers = [
+            asyncio.create_task(
+                _download_worker(
+                    download_queue,
+                    decrypt_pipe_input,
+                    client)) for _ in range(
+                self._max_workers)]
+
+        # Wait for the download workers to finish.
+        await download_queue.join()
+        logging.info("Downloading complete.")
+
+        # After all the tasks in the download queue are finished,
+        # put a None into the decrypt pip to stop the decrypt process.
+        decrypt_pipe_input.send(None)
+        decrypt_pipe_input.close()
+
+        # Cancel all download workers.
+        for worker in workers:
+            worker.cancel()
+
+        await client.close()  # CLose the http session.
+
+        # Wait for the process to finish.
+        decrypt_process.join()
+
+        # Write the concat info and invoke ffmpeg to concatinate the files.
+        _write_concat_info(self._resume_code, len(stream.segments))
+        _merge_segments(self._output_file_name)
+        _remove_segments()
+
+    @classmethod
+    async def from_url(cls, url: str, output_file_name: str, resume_code=None, max_workers: int = 3, hooks: dict = {}):
+        client = aiohttp.ClientSession()
+        resp = await client.get(url)
+        resp_text = await resp.text()
+        await client.close()
+        return cls(resp_text, output_file_name, resume_code, max_workers, hooks)
+
+    @classmethod
+    async def from_file(cls, file_path: str, output_file_name: str, resume_code=None, max_workers: int = 3, hooks: dict = {}):
+        with open(file_path, "r") as file:
+            m3u8 = file.read()
+        return cls(m3u8, output_file_name, resume_code, max_workers, hooks)
