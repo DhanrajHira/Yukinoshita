@@ -1,9 +1,10 @@
 import aiohttp
 import asyncio
 import m3u8
-from Crypto.Cipher import AES
 import os
-from multiprocessing import Semaphore, connection, Process, Pipe
+import shutil
+from Crypto.Cipher import AES
+from multiprocessing import connection, Process, Pipe
 import subprocess
 import logging
 
@@ -38,6 +39,9 @@ def _merge_segments(output_file_name):
         f"ffmpeg -f concat -safe 0 -i Segments{os.path.sep}{output_file_name}-concat_info.txt -c copy {output_file_name}{OUTPUT_EXTENSION} -hide_banner -loglevel warning"
     )
 
+def _remove_segments():
+    if os.path.isdir(SEGMENT_DIR):
+        shutil.rmtree(SEGMENT_DIR)
 
 def _decrypt_worker(
         pipe_output: connection.PipeConnection,
@@ -124,12 +128,13 @@ class Downloader(object):
             m3u8_str: str,
             output_file_name: str,
             resume_code=None,
-            max_workers: int = 3) -> None:
+            max_workers: int = 3,
+            hooks: dict = {}) -> None:
         self._m3u8: m3u8.M3U8 = m3u8.M3U8(m3u8_str)
         self._max_workers = max_workers
         self._output_file_name = output_file_name.replace(" ", "-")
         self._resume_code = resume_code or self._output_file_name
-
+        self._hooks = hooks
     async def run(self):
         # The download queue that will be used by download workers
         download_queue: asyncio.Queue = asyncio.Queue()
@@ -143,9 +148,12 @@ class Downloader(object):
         # Check if the m3u8 file passed in has multiple streams, if this is the
         # case then select the stream with the highest "bandwidth" specified.
         if len(self._m3u8.playlists):
-            stream_uri = max(
-                *self._m3u8.playlists,
-                key=lambda p: p.stream_info.bandwidth).uri
+            if self._hooks.get("playlist_selector", None):
+                stream_uri = self._hooks["playlist_selector"](self._m3u8.playlists).uri
+            else:
+                stream_uri = max(
+                    *self._m3u8.playlists,
+                    key=lambda p: p.stream_info.bandwidth).uri
             resp = await client.get(stream_uri)
             stream = m3u8.M3U8(await resp.text())
         else:
@@ -230,17 +238,18 @@ class Downloader(object):
         # Write the concat info and invoke ffmpeg to concatinate the files.
         _write_concat_info(self._resume_code, len(stream.segments))
         _merge_segments(self._output_file_name)
+        _remove_segments()
 
     @classmethod
-    async def from_url(cls, url: str, output_file_name: str, resume_code=None, max_workers: int = 3):
+    async def from_url(cls, url: str, output_file_name: str, resume_code=None, max_workers: int = 3, hooks: dict = {}):
         client = aiohttp.ClientSession()
         resp = await client.get(url)
         resp_text = await resp.text()
         await client.close()
-        return cls(resp_text, output_file_name, resume_code, max_workers)
+        return cls(resp_text, output_file_name, resume_code, max_workers, hooks)
 
     @classmethod
-    async def from_file(cls, file_path: str, output_file_name: str, resume_code=None, max_workers: int = 3):
+    async def from_file(cls, file_path: str, output_file_name: str, resume_code=None, max_workers: int = 3, hooks: dict = {}):
         with open(file_path, "r") as file:
             m3u8 = file.read()
-        return cls(m3u8, output_file_name, resume_code, max_workers)
+        return cls(m3u8, output_file_name, resume_code, max_workers, hooks)
